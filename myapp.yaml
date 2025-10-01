@@ -1,0 +1,173 @@
+# PodDisruptionBudget — фиксируем минимальный рабочий набор подов.
+# Причина: при обслуживании кластера хотим сохранить хотя бы 2 пода,
+# т.к. меньше 2 приложение теряет в отказоустойчивости.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+  namespace: web-app
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: web-app
+
+---
+# Deployment of the application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: web-app
+  labels:
+    app: web-app
+spec:
+  # Deployment — стартуем с минимального числа реплик (2), HPA поднимет до 4 по нагрузке 
+  # Решения исходят из вводных: 
+  # - по результатам нагрузочного теста 4 пода выдерживают пик;
+  # - у приложения дневной цикл (ночью нагрузка на порядок ниже).
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Не допускаем снижения доступных реплик во время апдейта — повышаем доступность.
+      maxUnavailable: 0
+      # Разрешаем поднять +1 временно, чтобы не терять capacity при обновлении.
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      affinity:
+        # Мы применяем podAntiAffinity с requiredDuringSchedulingIgnoredDuringExecution, 
+        # чтобы жёстко предотвратить colocate подов этого приложения на одной ноде. 
+        # Это повышает устойчивость к падению ноды: потеря узла не вырубит сразу несколько подов. 
+        # Минус: при нехватке нод/ресурсов некоторые поды могут оставаться Pending.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: web-app
+              topologyKey: kubernetes.io/hostname
+        # Равномерное распределение по зонам (AZ). maxSkew=1 — стараемся держать по 1 поду в каждой зоне.
+        # whenUnsatisfiable: DoNotSchedule — если невозможно распределить по зонам, pod останется Pending,
+        # что сигнализирует о нехватке ресурсов/неподготовленности инфраструктуры.
+        podTopologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app: web-app
+      containers:
+        - name: web-app
+          image: nginx:alpine  # здесь условный образ приложения
+          imagePullPolicy: IfNotPresent
+          # Ресурсы выбраны на основе поведения приложения и нагрузочного тестирования:
+          # 1. После старта (5–10s) под выходит в steady-state: потребление стабилизируется
+          #    на уровне ≈0.1 CPU и 128Mi памяти.
+          #    Эти значения фиксируем как requests — это минимальная гарантированная квота,
+          #    чтобы Scheduler мог эффективно упаковывать поды (особенно ночью при низкой нагрузке).
+          #
+          # 2. Предположим, в пике нагрузочного теста под потреблял до ~2 CPU и ~4Gi памяти.
+          #    Чтобы избежать троттлинга и покрыть краткосрочные спайки,
+          #    добавляем запас ~20%: выставляем limits на 2400m CPU и 4.8Gi памяти.
+          #
+          # Итог:
+          # – requests отражают реальное минимальное (steady-state) потребление;
+          # – limits гарантируют безопасный потолок при пиковых нагрузках;
+          # – HPA масштабируется относительно requests (~1000% при выходе на пик),
+          #   что позволяет динамически балансировать экономию ночью и устойчивость днём.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "2400m"
+              memory: "4.8Gi"
+          # StartupProbe — даём поду время полностью стартовать, чтобы HPA и сервис 
+          # не считали его готовым раньше времени. Параметры выбраны исходя из
+          # наблюдаемого времени старта приложения (~5–10s) с запасом.
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: 80
+            failureThreshold: 12   # проверка каждые 1s → максимум 12s для старта
+            periodSeconds: 1
+          # readinessProbe — под не попадёт в сервис-раутинг, пока не готов принимать запросы (предотвращает раннюю маршрутизацию и 5xx)
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 80
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            failureThreshold: 3
+          # livenessProbe — перезапустит «зависший» контейнер во время работы. Вместе они уменьшают «псевдоотказы» при старте и помогают поддерживать доступность.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+          ports:
+            - containerPort: 80
+              name: http
+
+---
+# Horizontal Pod Autoscaler (HPA) — автоскейлинг по ресурсу
+# Обоснование:
+# - Приложение имеет дневной цикл: ночью мало запросов — хотим экономить (minReplicas = 2).
+# - По нагрузочному тесту: 4 пода справляются с пиком — ставим maxReplicas = 4.
+# - HPA по CPU/памяти позволяет динамически масштабироваться при реальной нагрузке.
+
+# Horizontal Pod Autoscaler (HPA)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa
+  namespace: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 1000 # потому что реагирует относительно requests, которые у нас минимальные
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 1000 # то же самое для памяти
+
+---
+# ClusterIP обеспечивает внутреннюю связь между сервисами в кластере — достаточно для backend-микросервиса. 
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app-svc
+  namespace: web-app
+spec:
+  selector:
+    app: web-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+
+---
+# Ingress не добавляем — нужен только для фронтендов и внешнего трафика.
+# Здесь его специально нет, так как данный сервис выступает как backend-микросервис.
